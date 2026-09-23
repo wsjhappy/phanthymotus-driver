@@ -185,9 +185,11 @@ class Go1HighSdkClient:
         self._running = False
         self._thread = None
         self._snapshot: dict = {}
+        self._snapshot_received_at = 0.0
         # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
+        self._move_started_at = 0.0 # 同一连续速度目标首次被接受的 monotonic 时间
         self._posture = None        # 【纯新增】dict: mode/euler/body_height/foot_raise/speed_level；持续保持(loco/gesture 用)
         self._desired_gait = 1      # 常驻期望步态（switch_gait 卡写；move 未显式指定 gait 时用它）。默认 1=trot
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
@@ -311,6 +313,7 @@ class Go1HighSdkClient:
             out["battery"] = parse_battery(_g(s, "bms", None))
             with self._lock:
                 self._snapshot = out
+                self._snapshot_received_at = time.monotonic()
         except Exception as e:
             print(f"[Go1HighSdk] parse_state error: {e}", flush=True)
 
@@ -331,10 +334,17 @@ class Go1HighSdkClient:
         vx = self._clamp(vx, VX_MAX)
         vy = self._clamp(vy, VY_MAX)
         vyaw = self._clamp(vyaw, VYAW_MAX)
+        now = time.monotonic()
         with self._lock:
             g = self._desired_gait if gait is None else int(gait)
-            self._move_cmd = (vx, vy, vyaw, g)
-            self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
+            next_cmd = (vx, vy, vyaw, g)
+            # loco 的定时运动会每 100ms 重发同一命令。只在新命令、命令改变或
+            # 看门狗已过期时重置起点，避免 motion_feedback 永远停在 starting。
+            if (self._move_cmd is None or now >= self._move_deadline
+                    or self._move_cmd != next_cmd):
+                self._move_started_at = now
+            self._move_cmd = next_cmd
+            self._move_deadline = now + MOVE_WATCHDOG_S
             self._posture = None   # 速度命令优先，清掉姿态
         return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": g}
 
@@ -343,6 +353,7 @@ class Go1HighSdkClient:
         with self._lock:
             self._move_cmd = None
             self._move_deadline = 0.0
+            self._move_started_at = 0.0
             self._posture = None
 
     def set_posture(self, mode, euler=(0.0, 0.0, 0.0), body_height=0.0,
@@ -353,6 +364,8 @@ class Go1HighSdkClient:
         不影响任何现有 move/idle/状态读取逻辑。"""
         with self._lock:
             self._move_cmd = None
+            self._move_deadline = 0.0
+            self._move_started_at = 0.0
             self._posture = {"mode": int(mode),
                              "euler": [float(euler[0]), float(euler[1]), float(euler[2])],
                              "body_height": float(body_height),
@@ -409,5 +422,30 @@ class Go1HighSdkClient:
             print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
 
     def snapshot(self) -> dict:
+        """返回遥测快照，并附上当前仍受看门狗保护的运动指令上下文。
+
+        commanded_motion 是进程内已接受指令的只读元数据，不改变 HighState，也不
+        下发额外命令。状态卡可据此区分“没有下达运动”与“已下达但没有运动”。
+        """
+        now = time.monotonic()
         with self._lock:
-            return dict(self._snapshot) if self._snapshot else {"fresh": False}
+            out = dict(self._snapshot) if self._snapshot else {"fresh": False}
+            out["telemetry_age_sec"] = (
+                round(max(0.0, now - self._snapshot_received_at), 3)
+                if self._snapshot_received_at > 0.0 else None
+            )
+            active = self._move_cmd is not None and now < self._move_deadline
+            if active:
+                vx, vy, vyaw, gait = self._move_cmd
+                out["commanded_motion"] = {
+                    "active": True,
+                    "vx": vx,
+                    "vy": vy,
+                    "vyaw": vyaw,
+                    "gait": gait,
+                    "active_for_sec": round(max(0.0, now - self._move_started_at), 3),
+                    "watchdog_remaining_sec": round(max(0.0, self._move_deadline - now), 3),
+                }
+            else:
+                out["commanded_motion"] = {"active": False}
+            return out
