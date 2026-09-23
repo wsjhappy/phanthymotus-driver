@@ -103,7 +103,7 @@ class MotionFeedbackBuilderTests(unittest.TestCase):
     def test_stale_or_incomplete_input_is_unavailable(self):
         cases = [
             (snapshot(fresh=False), "telemetry_stale"),
-            (snapshot() | {"telemetry_age_sec": 1.0}, "telemetry_stale"),
+            (dict(snapshot(), telemetry_age_sec=1.0), "telemetry_stale"),
             ({"fresh": True, "telemetry_age_sec": 0.01}, "command_state_missing"),
             (
                 snapshot(command=active_command(), velocity=None),
