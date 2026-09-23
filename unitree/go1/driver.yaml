@@ -25,6 +25,7 @@ build_context_extras:
 # even though the card is read-only (samples velocity/mode, action=report).
 cards:
   - { name: loco_state,         type: sensor }
+  - { name: motion_feedback,    type: sensor }
   - { name: battery,            type: sensor }
   - { name: face_light,         type: actuator }
   - { name: camera_rgb,         type: sensor }
