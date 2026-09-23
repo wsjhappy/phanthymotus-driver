@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
-> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
+> 本 bundle 当前发布 **25 张卡**：12 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
+> **4 个聚合文件**：`sensors.py`（12 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -20,6 +20,7 @@
 | 卡片（= 文件） | 能力 | 输出（ROS2 topic） |
 |---|---|---|
 | `loco_state` | 运动状态 | `/{ns}/loco/state`：mode / gait / velocity_body_mps / yaw_speed_rad_s / body_height_m / position_m（里程计，漂移） |
+| `motion_feedback` | 运动执行反馈 | `/{ns}/state/motion_feedback`：对比已接受的 `loco` 指令与实测速度，输出 idle / starting / moving / motion_not_observed / unavailable；只读，不控制机器人 |
 | `battery` | 电量（BMS） | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
@@ -97,9 +98,9 @@ go1_bundle/
 ├── main.py                 # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py       # 共享 raw SDK client（已由 sdk_proxy.py 子进程承接）
 ├── sdk_proxy.py            # SDK 子进程代理：隔离 robot_interface 避免 GIL 冲突
-│   ── 聚合卡文件（sensors.py = 12 张）──
+│   ── 聚合卡文件（sensors.py = 13 张，含 model resource）──
 ├── sensors.py              # 状态卡合集：battery/imu/feet/fall_alarm/obstacle_range/
-│                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/
+│                           #   remote_controller/udp_diagnostics/loco_state/motion_feedback/odometry/joints/
 │                           #   activity_monitor/model
 │   ── 聚合卡文件（controllers.py = 5 张）──
 ├── controllers.py          # 运动控制合集：loco/body_pose/switch_gait/gesture/special_motion
