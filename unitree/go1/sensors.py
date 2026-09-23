@@ -1,6 +1,7 @@
 """
 sensors.py — Go1 状态/资源卡聚合（battery, imu, feet, fall_alarm, obstacle_range,
-             remote_controller, udp_diagnostics, loco_state, odometry, joints, model）。
+             remote_controller, udp_diagnostics, loco_state, motion_feedback,
+             odometry, joints, model）。
 
 自包含：一张合并文件 = 多张卡片。main.py 按 config.yaml 里的卡名手动 import 并 make_plugin()。
 每张卡保持独立的 CARD / Plugin / make_plugin，只是合并在同一文件。
@@ -600,6 +601,256 @@ class LocoStatePlugin:
 
 def make_loco_state(plugin_config, namespace, executor, client):
     return LocoStatePlugin(plugin_config, namespace, executor, client)
+
+
+# ============================================================================
+# motion_feedback.py — 已接受运动指令与实测运动的闭环反馈卡
+# ============================================================================
+
+_CARD_MOTION_FEEDBACK = "motion_feedback"
+_TOPIC_MOTION_FEEDBACK = "/{ns}/state/motion_feedback"
+_NODE_MOTION_FEEDBACK = "go1_motion_feedback"
+_DESC_MOTION_FEEDBACK = (
+    "Go1 motion execution feedback — compares the active loco command with "
+    "measured HighState velocity and reports idle/starting/moving/"
+    "motion_not_observed/unavailable. Read-only; never sends control commands."
+)
+
+
+def _finite_config(plugin_config, name, default, minimum, maximum):
+    try:
+        value = float(plugin_config.get(name, default))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"motion_feedback.{name} must be a number") from exc
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(
+            f"motion_feedback.{name} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _motion_feedback_config(plugin_config):
+    plugin_config = plugin_config or {}
+    return {
+        "publish_hz": _finite_config(plugin_config, "publish_hz", 5.0, 0.5, 20.0),
+        "startup_grace_sec": _finite_config(
+            plugin_config, "startup_grace_sec", 0.3, 0.0, 5.0
+        ),
+        "max_telemetry_age_sec": _finite_config(
+            plugin_config, "max_telemetry_age_sec", 0.5, 0.05, 5.0
+        ),
+        "min_linear_command_mps": _finite_config(
+            plugin_config, "min_linear_command_mps", 0.05, 0.0, 1.0
+        ),
+        "min_yaw_command_rad_s": _finite_config(
+            plugin_config, "min_yaw_command_rad_s", 0.1, 0.0, 2.0
+        ),
+        "min_linear_response_mps": _finite_config(
+            plugin_config, "min_linear_response_mps", 0.03, 0.0, 1.0
+        ),
+        "min_yaw_response_rad_s": _finite_config(
+            plugin_config, "min_yaw_response_rad_s", 0.08, 0.0, 2.0
+        ),
+    }
+
+
+def _as_finite(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _motion_feedback_result(snap, status, reason, action, **extra):
+    out = {
+        "timestamp_ms": int(time.time() * 1000),
+        "control_level": snap.get("control_level", "HIGHLEVEL"),
+        "fresh": bool(snap.get("fresh", False)),
+        "available": status != "unavailable",
+        "status": status,
+        "reason": reason,
+        "recommended_action": action,
+    }
+    out.update(extra)
+    return out
+
+
+def _build_motion_feedback(snap: dict, config: dict) -> dict:
+    """把运动意图和实测速度压缩成一个可直接决策的状态。
+
+    只比较被指令要求的轴，并要求实测方向与指令方向一致，避免机器人受外力向
+    反方向滑动时被误判为“执行成功”。
+    """
+    if not snap.get("fresh", False):
+        return _motion_feedback_result(
+            snap, "unavailable", "telemetry_stale", "check_telemetry"
+        )
+    telemetry_age = _as_finite(snap.get("telemetry_age_sec"))
+    if telemetry_age is None or telemetry_age > config["max_telemetry_age_sec"]:
+        return _motion_feedback_result(
+            snap, "unavailable", "telemetry_stale", "check_telemetry"
+        )
+
+    command = snap.get("commanded_motion")
+    if not isinstance(command, dict) or "active" not in command:
+        return _motion_feedback_result(
+            snap, "unavailable", "command_state_missing", "check_driver"
+        )
+    if not command.get("active"):
+        return _motion_feedback_result(
+            snap, "idle", "no_active_motion_command", "none"
+        )
+
+    vx = _as_finite(command.get("vx"))
+    vy = _as_finite(command.get("vy"))
+    vyaw = _as_finite(command.get("vyaw"))
+    active_for = _as_finite(command.get("active_for_sec"))
+    if None in (vx, vy, vyaw, active_for):
+        return _motion_feedback_result(
+            snap, "unavailable", "command_state_invalid", "check_driver"
+        )
+
+    command_linear = math.hypot(vx, vy)
+    linear_requested = command_linear >= config["min_linear_command_mps"]
+    yaw_requested = abs(vyaw) >= config["min_yaw_command_rad_s"]
+    commanded = {
+        "forward_mps": round(vx, 3),
+        "lateral_mps": round(vy, 3),
+        "yaw_rad_s": round(vyaw, 3),
+        "active_for_sec": round(max(0.0, active_for), 3),
+    }
+    if not linear_requested and not yaw_requested:
+        return _motion_feedback_result(
+            snap, "idle", "no_effective_motion_command", "none",
+            commanded=commanded,
+        )
+
+    velocity = snap.get("velocity")
+    observed_vx = observed_vy = None
+    if isinstance(velocity, (list, tuple)) and len(velocity) >= 2:
+        observed_vx = _as_finite(velocity[0])
+        observed_vy = _as_finite(velocity[1])
+    observed_yaw = _as_finite(snap.get("yaw_speed"))
+    if ((linear_requested and None in (observed_vx, observed_vy))
+            or (yaw_requested and observed_yaw is None)):
+        return _motion_feedback_result(
+            snap, "unavailable", "velocity_missing", "check_telemetry",
+            commanded=commanded,
+        )
+
+    # Signed projections: positive means the robot is moving in the requested direction.
+    linear_along_command = None
+    linear_ok = False
+    if linear_requested:
+        linear_along_command = (observed_vx * vx + observed_vy * vy) / command_linear
+        linear_ok = linear_along_command >= config["min_linear_response_mps"]
+    yaw_along_command = None
+    yaw_ok = False
+    if yaw_requested:
+        yaw_along_command = observed_yaw if vyaw >= 0.0 else -observed_yaw
+        yaw_ok = yaw_along_command >= config["min_yaw_response_rad_s"]
+
+    observed = {
+        "forward_mps": round(observed_vx or 0.0, 3),
+        "lateral_mps": round(observed_vy or 0.0, 3),
+        "yaw_rad_s": round(observed_yaw or 0.0, 3),
+    }
+    if linear_along_command is not None:
+        observed["along_command_mps"] = round(linear_along_command, 3)
+    if yaw_along_command is not None:
+        observed["yaw_along_command_rad_s"] = round(yaw_along_command, 3)
+
+    if linear_ok or yaw_ok:
+        return _motion_feedback_result(
+            snap, "moving", "measured_motion_matches_command", "continue",
+            commanded=commanded, observed=observed,
+        )
+    if active_for < config["startup_grace_sec"]:
+        return _motion_feedback_result(
+            snap, "starting", "within_startup_grace", "wait",
+            commanded=commanded, observed=observed,
+        )
+    return _motion_feedback_result(
+        snap, "motion_not_observed", "accepted_command_without_measured_motion",
+        "stop_and_inspect", commanded=commanded, observed=observed,
+    )
+
+
+class MotionFeedbackPlugin:
+    def __init__(self, plugin_config, namespace, executor, client):
+        self._client = client
+        self._config = _motion_feedback_config(plugin_config)
+        self._topic = _TOPIC_MOTION_FEEDBACK.format(ns=namespace)
+        self._node = None
+        if _HAS_ROS2 and executor is not None:
+            try:
+                self._node = Node(_NODE_MOTION_FEEDBACK)
+                self._pub = self._node.create_publisher(String, self._topic, _QOS)
+                self._node.create_timer(1.0 / self._config["publish_hz"], self._tick)
+                executor.add_node(self._node)
+                self._node.get_logger().info(
+                    f"go1 motion_feedback → {self._topic} "
+                    f"@ {self._config['publish_hz']}Hz"
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[{_CARD_MOTION_FEEDBACK}] ROS2 发布不可用，退回 MCP 轮询: {e}",
+                    flush=True,
+                )
+                self._node = None
+
+    def _build(self):
+        return _build_motion_feedback(self._client.snapshot(), self._config)
+
+    def _tick(self):
+        try:
+            m = String()
+            m.data = json.dumps(self._build())
+            self._pub.publish(m)
+        except Exception as e:  # noqa: BLE001
+            self._node.get_logger().error(f"publish {self._topic} error: {e}")
+
+    def get_tool(self):
+        desc = _DESC_MOTION_FEEDBACK + (
+            f" — → {self._topic}" if self._node else " — poll via MCP action=info"
+        )
+        return {
+            "name": _CARD_MOTION_FEEDBACK,
+            "type": "sensor",
+            "multiInstance": False,
+            "description": desc,
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": (
+                [{"topic": self._topic, "format": "data/json"}] if self._node else []
+            ),
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "read", "get", _CARD_MOTION_FEEDBACK):
+            return {
+                "state": "running",
+                "data": self._build(),
+                "topic_out": (
+                    [{"topic": self._topic, "format": "data/json"}]
+                    if self._node else []
+                ),
+            }
+        return None
+
+
+def make_motion_feedback(plugin_config, namespace, executor, client):
+    return MotionFeedbackPlugin(plugin_config, namespace, executor, client)
 
 
 # ============================================================================
