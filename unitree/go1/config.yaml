@@ -8,6 +8,15 @@ plugins:
   # ── 状态卡（读同一 client 的 HighState）──
   loco_state:                   # 运动状态：mode/gait/velocity/body_height/odometry
     enabled: true
+  motion_feedback:              # 指令-实测闭环：识别运动指令已接受但机器人未运动（只读）
+    enabled: true
+    publish_hz: 5
+    startup_grace_sec: 0.3
+    max_telemetry_age_sec: 0.5
+    min_linear_command_mps: 0.05
+    min_yaw_command_rad_s: 0.1
+    min_linear_response_mps: 0.03
+    min_yaw_response_rad_s: 0.08
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
 
