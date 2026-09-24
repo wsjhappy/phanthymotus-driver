@@ -31,7 +31,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 COPY unitree_legged_sdk /opt/unitree_legged_sdk
 RUN cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
     cmake -DPYTHON_BUILD=ON .. && make -j"$(nproc)" && \
-    find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; || true
+    find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; && \
+    cd /work && python3 -c "import robot_interface as r; assert hasattr(r.UDP, 'udpState')"
 
 COPY common/ /work/common/
 COPY main.py           /work/main.py
@@ -40,6 +41,7 @@ COPY sdk_proxy.py      /work/sdk_proxy.py
 # 聚合卡文件（4 个）
 COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
+COPY loco_control.py   /work/loco_control.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
 COPY config.yaml       /work/config.yaml
